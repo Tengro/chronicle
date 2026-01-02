@@ -1,0 +1,23 @@
+# Rust
+/target/
+Cargo.lock
+
+# Node
+node_modules/
+*.node
+
+# Build artifacts
+*.d.ts
+index.js
+
+# Test artifacts
+test-store/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
