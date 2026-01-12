@@ -47,7 +47,7 @@ impl Sequence {
 }
 
 /// Unique identifier for a branch.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BranchId(pub u64);
 
 impl fmt::Debug for BranchId {

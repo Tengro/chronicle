@@ -145,6 +145,11 @@ impl RecordLog {
         self.read_record(&mut *file)
     }
 
+    /// Iterate all records from the beginning.
+    pub fn iter(&self) -> RecordIterator {
+        self.iter_from(0)
+    }
+
     /// Iterate all records from a given offset.
     pub fn iter_from(&self, offset: u64) -> RecordIterator {
         RecordIterator {

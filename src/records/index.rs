@@ -1,21 +1,15 @@
 //! Record indices for efficient lookups.
+//!
+//! Indices are rebuilt from the record log on startup rather than persisted.
+//! This gives O(1) sync time at the cost of O(N) startup time, which is
+//! acceptable for stores up to millions of records (rebuilds in seconds).
 
-use crate::error::{Result, StoreError};
+use crate::error::Result;
+use crate::records::RecordLog;
 use crate::types::{BranchId, RecordId, Sequence};
 use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-
-/// Magic bytes for index files.
-const INDEX_MAGIC: &[u8; 4] = b"IDX\0";
-
-/// Current index format version.
-const INDEX_VERSION: u8 = 1;
-
-/// Index entry size (sequence + offset).
-const INDEX_ENTRY_SIZE: usize = 16;
 
 /// Index mapping sequence numbers to file offsets.
 pub struct RecordIndex {
@@ -23,7 +17,8 @@ pub struct RecordIndex {
     path: PathBuf,
 
     /// In-memory index: (branch, sequence) -> offset.
-    entries: RwLock<HashMap<(BranchId, Sequence), u64>>,
+    /// Uses BTreeMap for O(log n) range queries and ordered iteration.
+    entries: RwLock<BTreeMap<(BranchId, Sequence), u64>>,
 
     /// Record ID to offset.
     id_to_offset: RwLock<HashMap<RecordId, u64>>,
@@ -39,13 +34,13 @@ pub struct RecordIndex {
 }
 
 impl RecordIndex {
-    /// Create a new index.
+    /// Create a new empty index.
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
         Ok(Self {
             path,
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(BTreeMap::new()),
             id_to_offset: RwLock::new(HashMap::new()),
             type_index: RwLock::new(HashMap::new()),
             caused_by_index: RwLock::new(HashMap::new()),
@@ -53,24 +48,37 @@ impl RecordIndex {
         })
     }
 
-    /// Load index from file.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
+    /// Create index by rebuilding from the record log.
+    ///
+    /// This scans the entire log sequentially and builds all indexes.
+    /// For a store with 1M records, this typically takes 1-3 seconds on SSD.
+    pub fn rebuild_from_log(path: impl AsRef<Path>, log: &RecordLog) -> Result<Self> {
+        let index = Self::new(path)?;
 
-        let mut index = Self {
-            path: path.clone(),
-            entries: RwLock::new(HashMap::new()),
-            id_to_offset: RwLock::new(HashMap::new()),
-            type_index: RwLock::new(HashMap::new()),
-            caused_by_index: RwLock::new(HashMap::new()),
-            linked_to_index: RwLock::new(HashMap::new()),
-        };
+        // Iterate through all records in the log
+        for result in log.iter() {
+            let (offset, record) = result?;
 
-        if path.exists() {
-            index.load_from_file()?;
+            // Add to all indexes
+            index.add(
+                record.id,
+                record.branch,
+                record.sequence,
+                offset,
+                &record.record_type,
+                &record.caused_by,
+                &record.linked_to,
+            );
         }
 
         Ok(index)
+    }
+
+    /// Load index - for backwards compatibility, just creates empty index.
+    /// Use `rebuild_from_log` after opening the log to populate it.
+    #[deprecated(note = "Use rebuild_from_log instead")]
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        Self::new(path)
     }
 
     /// Add an entry to the index.
@@ -168,12 +176,52 @@ impl RecordIndex {
 
     /// Get the highest sequence for a branch.
     pub fn max_sequence(&self, branch: BranchId) -> Option<Sequence> {
-        self.entries
-            .read()
-            .keys()
-            .filter(|(b, _)| *b == branch)
-            .map(|(_, s)| *s)
-            .max()
+        let entries = self.entries.read();
+        // With BTreeMap, we can efficiently find the max by ranging to the end
+        let end_key = (branch, Sequence(u64::MAX));
+        entries
+            .range(..=end_key)
+            .rev()
+            .find(|((b, _), _)| *b == branch)
+            .map(|((_, s), _)| *s)
+    }
+
+    /// Query records in a sequence range with efficient O(log n + k) lookup.
+    ///
+    /// Returns offsets for records on `branch` with sequences in [from, to].
+    /// If `reverse` is true, returns offsets in descending sequence order.
+    /// `limit` caps the number of results.
+    pub fn query_range(
+        &self,
+        branch: BranchId,
+        from: Option<Sequence>,
+        to: Option<Sequence>,
+        limit: usize,
+        reverse: bool,
+    ) -> Vec<(Sequence, u64)> {
+        let entries = self.entries.read();
+
+        let start = (branch, from.unwrap_or(Sequence(0)));
+        let end = (branch, to.unwrap_or(Sequence(u64::MAX)));
+
+        if reverse {
+            // Iterate backwards from `end` to `start`
+            entries
+                .range(start..=end)
+                .rev()
+                .filter(|((b, _), _)| *b == branch)
+                .take(limit)
+                .map(|((_, seq), offset)| (*seq, *offset))
+                .collect()
+        } else {
+            // Iterate forwards from `start` to `end`
+            entries
+                .range(start..=end)
+                .filter(|((b, _), _)| *b == branch)
+                .take(limit)
+                .map(|((_, seq), offset)| (*seq, *offset))
+                .collect()
+        }
     }
 
     /// Get count of records.
@@ -181,154 +229,13 @@ impl RecordIndex {
         self.id_to_offset.read().len()
     }
 
-    /// Save index to file.
+    /// Save index to file - NO-OP.
+    ///
+    /// Index is no longer persisted; it's rebuilt from the log on startup.
+    /// This method exists for API compatibility but does nothing.
+    #[deprecated(note = "Index is no longer persisted, rebuilt from log on startup")]
     pub fn save(&self) -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&self.path)?;
-
-        // Write magic
-        file.write_all(INDEX_MAGIC)?;
-
-        // Write version
-        file.write_all(&[INDEX_VERSION])?;
-
-        // Write entry count
-        let entries = self.entries.read();
-        let count = entries.len() as u64;
-        file.write_all(&count.to_le_bytes())?;
-
-        // Write entries
-        for ((branch, sequence), offset) in entries.iter() {
-            file.write_all(&branch.0.to_le_bytes())?;
-            file.write_all(&sequence.0.to_le_bytes())?;
-            file.write_all(&offset.to_le_bytes())?;
-        }
-
-        // Write ID index
-        let id_to_offset = self.id_to_offset.read();
-        let id_count = id_to_offset.len() as u64;
-        file.write_all(&id_count.to_le_bytes())?;
-
-        for (id, offset) in id_to_offset.iter() {
-            file.write_all(&id.0.to_le_bytes())?;
-            file.write_all(&offset.to_le_bytes())?;
-        }
-
-        // Write type index
-        let type_index = self.type_index.read();
-        let type_count = type_index.len() as u64;
-        file.write_all(&type_count.to_le_bytes())?;
-
-        for (record_type, ids) in type_index.iter() {
-            let type_bytes = record_type.as_bytes();
-            file.write_all(&(type_bytes.len() as u16).to_le_bytes())?;
-            file.write_all(type_bytes)?;
-            file.write_all(&(ids.len() as u64).to_le_bytes())?;
-            for id in ids {
-                file.write_all(&id.0.to_le_bytes())?;
-            }
-        }
-
-        file.sync_all()?;
-        Ok(())
-    }
-
-    /// Load index from file.
-    fn load_from_file(&mut self) -> Result<()> {
-        let mut file = File::open(&self.path)?;
-
-        // Read magic
-        let mut magic = [0u8; 4];
-        file.read_exact(&mut magic)?;
-        if &magic != INDEX_MAGIC {
-            return Err(StoreError::InvalidFormat("Invalid index magic".into()));
-        }
-
-        // Read version
-        let mut version = [0u8; 1];
-        file.read_exact(&mut version)?;
-        if version[0] != INDEX_VERSION {
-            return Err(StoreError::InvalidFormat(format!(
-                "Unsupported index version: {}",
-                version[0]
-            )));
-        }
-
-        // Read entry count
-        let mut count_bytes = [0u8; 8];
-        file.read_exact(&mut count_bytes)?;
-        let count = u64::from_le_bytes(count_bytes) as usize;
-
-        // Read entries
-        let mut entries = self.entries.write();
-        for _ in 0..count {
-            let mut branch_bytes = [0u8; 8];
-            file.read_exact(&mut branch_bytes)?;
-            let branch = BranchId(u64::from_le_bytes(branch_bytes));
-
-            let mut seq_bytes = [0u8; 8];
-            file.read_exact(&mut seq_bytes)?;
-            let sequence = Sequence(u64::from_le_bytes(seq_bytes));
-
-            let mut offset_bytes = [0u8; 8];
-            file.read_exact(&mut offset_bytes)?;
-            let offset = u64::from_le_bytes(offset_bytes);
-
-            entries.insert((branch, sequence), offset);
-        }
-        drop(entries);
-
-        // Read ID index
-        let mut id_count_bytes = [0u8; 8];
-        file.read_exact(&mut id_count_bytes)?;
-        let id_count = u64::from_le_bytes(id_count_bytes) as usize;
-
-        let mut id_to_offset = self.id_to_offset.write();
-        for _ in 0..id_count {
-            let mut id_bytes = [0u8; 8];
-            file.read_exact(&mut id_bytes)?;
-            let id = RecordId(u64::from_le_bytes(id_bytes));
-
-            let mut offset_bytes = [0u8; 8];
-            file.read_exact(&mut offset_bytes)?;
-            let offset = u64::from_le_bytes(offset_bytes);
-
-            id_to_offset.insert(id, offset);
-        }
-        drop(id_to_offset);
-
-        // Read type index
-        let mut type_count_bytes = [0u8; 8];
-        file.read_exact(&mut type_count_bytes)?;
-        let type_count = u64::from_le_bytes(type_count_bytes) as usize;
-
-        let mut type_index = self.type_index.write();
-        for _ in 0..type_count {
-            let mut type_len_bytes = [0u8; 2];
-            file.read_exact(&mut type_len_bytes)?;
-            let type_len = u16::from_le_bytes(type_len_bytes) as usize;
-
-            let mut type_bytes = vec![0u8; type_len];
-            file.read_exact(&mut type_bytes)?;
-            let record_type = String::from_utf8_lossy(&type_bytes).into_owned();
-
-            let mut ids_count_bytes = [0u8; 8];
-            file.read_exact(&mut ids_count_bytes)?;
-            let ids_count = u64::from_le_bytes(ids_count_bytes) as usize;
-
-            let mut ids = Vec::with_capacity(ids_count);
-            for _ in 0..ids_count {
-                let mut id_bytes = [0u8; 8];
-                file.read_exact(&mut id_bytes)?;
-                ids.push(RecordId(u64::from_le_bytes(id_bytes)));
-            }
-
-            type_index.insert(record_type, ids);
-        }
-
+        // No-op: index is rebuilt from log on startup
         Ok(())
     }
 }
@@ -336,6 +243,7 @@ impl RecordIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::RecordInput;
     use tempfile::TempDir;
 
     #[test]
@@ -404,28 +312,137 @@ mod tests {
     }
 
     #[test]
-    fn test_save_and_load() {
+    fn test_rebuild_from_log() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("index.bin");
+        let log_path = dir.path().join("records.log");
+        let index_path = dir.path().join("index.bin");
 
-        // Create and save
-        {
-            let index = RecordIndex::new(&path).unwrap();
-            let branch = BranchId(1);
+        // Create log with some records
+        let log = RecordLog::open(&log_path).unwrap();
+        let branch = BranchId(1);
 
-            index.add(RecordId(1), branch, Sequence(1), 0, "test", &[], &[]);
-            index.add(RecordId(2), branch, Sequence(2), 100, "test", &[], &[]);
+        log.append(
+            RecordInput::raw("message", b"hello".to_vec()),
+            branch,
+            Sequence(1),
+        )
+        .unwrap();
+        log.append(
+            RecordInput::raw("message", b"world".to_vec()),
+            branch,
+            Sequence(2),
+        )
+        .unwrap();
+        log.append(
+            RecordInput::raw("code", b"fn main() {}".to_vec()),
+            branch,
+            Sequence(3),
+        )
+        .unwrap();
 
-            index.save().unwrap();
+        // Rebuild index from log
+        let index = RecordIndex::rebuild_from_log(&index_path, &log).unwrap();
+
+        // Verify all records are indexed
+        assert_eq!(index.count(), 3);
+        assert_eq!(index.get_by_type("message").len(), 2);
+        assert_eq!(index.get_by_type("code").len(), 1);
+
+        // Verify sequence lookups work
+        assert!(index.get_offset(branch, Sequence(1)).is_some());
+        assert!(index.get_offset(branch, Sequence(2)).is_some());
+        assert!(index.get_offset(branch, Sequence(3)).is_some());
+    }
+
+    #[test]
+    fn test_rebuild_from_empty_log() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("records.log");
+        let index_path = dir.path().join("index.bin");
+
+        let log = RecordLog::open(&log_path).unwrap();
+        let index = RecordIndex::rebuild_from_log(&index_path, &log).unwrap();
+
+        assert_eq!(index.count(), 0);
+    }
+
+    #[test]
+    fn test_query_range_forward() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+
+        // Add records with sequences 1-10
+        for i in 1..=10u64 {
+            index.add(RecordId(i), branch, Sequence(i), i * 100, "test", &[], &[]);
         }
 
-        // Load and verify
-        {
-            let index = RecordIndex::load(&path).unwrap();
+        // Query range [3, 7] forward
+        let results = index.query_range(branch, Some(Sequence(3)), Some(Sequence(7)), 100, false);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, Sequence(3)); // First result is seq 3
+        assert_eq!(results[4].0, Sequence(7)); // Last result is seq 7
+    }
 
-            assert_eq!(index.get_offset(BranchId(1), Sequence(1)), Some(0));
-            assert_eq!(index.get_offset(BranchId(1), Sequence(2)), Some(100));
-            assert_eq!(index.get_by_type("test").len(), 2);
+    #[test]
+    fn test_query_range_reverse() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+
+        // Add records with sequences 1-10
+        for i in 1..=10u64 {
+            index.add(RecordId(i), branch, Sequence(i), i * 100, "test", &[], &[]);
         }
+
+        // Query range [3, 7] reverse
+        let results = index.query_range(branch, Some(Sequence(3)), Some(Sequence(7)), 100, true);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].0, Sequence(7)); // First result is seq 7 (highest)
+        assert_eq!(results[4].0, Sequence(3)); // Last result is seq 3 (lowest)
+    }
+
+    #[test]
+    fn test_query_range_with_limit() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+
+        // Add records with sequences 1-100
+        for i in 1..=100u64 {
+            index.add(RecordId(i), branch, Sequence(i), i * 100, "test", &[], &[]);
+        }
+
+        // Query all with limit 10, forward
+        let results = index.query_range(branch, None, None, 10, false);
+        assert_eq!(results.len(), 10);
+        assert_eq!(results[0].0, Sequence(1)); // Starts at seq 1
+
+        // Query all with limit 10, reverse
+        let results = index.query_range(branch, None, None, 10, true);
+        assert_eq!(results.len(), 10);
+        assert_eq!(results[0].0, Sequence(100)); // Starts at seq 100 (newest)
+    }
+
+    #[test]
+    fn test_query_range_open_ended() {
+        let dir = TempDir::new().unwrap();
+        let index = RecordIndex::new(dir.path().join("index.bin")).unwrap();
+        let branch = BranchId(1);
+
+        // Add records with sequences 1-10
+        for i in 1..=10u64 {
+            index.add(RecordId(i), branch, Sequence(i), i * 100, "test", &[], &[]);
+        }
+
+        // Query from seq 5 to end
+        let results = index.query_range(branch, Some(Sequence(5)), None, 100, false);
+        assert_eq!(results.len(), 6); // 5,6,7,8,9,10
+        assert_eq!(results[0].0, Sequence(5));
+
+        // Query from beginning to seq 5
+        let results = index.query_range(branch, None, Some(Sequence(5)), 100, false);
+        assert_eq!(results.len(), 5); // 1,2,3,4,5
+        assert_eq!(results[4].0, Sequence(5));
     }
 }

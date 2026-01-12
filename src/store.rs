@@ -5,8 +5,9 @@ use crate::branches::BranchManager;
 use crate::error::{Result, StoreError};
 use crate::records::{RecordIndex, RecordLog};
 use crate::state::StateManager;
+use crate::subscriptions::{SubscriptionConfig, SubscriptionHandle, SubscriptionId, SubscriptionManager};
 use crate::types::{
-    Blob, Branch, BranchId, Hash, Record, RecordId, RecordInput, Sequence,
+    Blob, Branch, Hash, Record, RecordId, RecordInput, Sequence,
     StateOperation, StateRegistration, StateUpdateRecord, StoreStats, Timestamp,
 };
 use fs2::FileExt;
@@ -88,6 +89,9 @@ pub struct Store {
     /// Branch manager.
     branches: BranchManager,
 
+    /// Subscription manager for live updates.
+    subscriptions: SubscriptionManager,
+
     /// Lock for write operations to ensure atomicity.
     write_lock: Mutex<()>,
 }
@@ -118,10 +122,12 @@ impl Store {
 
         // Initialize components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
-        let index = RecordIndex::new(config.path.join("records.idx"))?;
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
         let mut state = StateManager::new(config.path.join("state.bin"))?;
         let branches = BranchManager::new(config.path.join("branches.bin"))?;
+
+        // Build index from log (empty for new store, but consistent with open())
+        let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
 
         // Connect state manager to log for disk-based traversal
         state.set_log(Arc::clone(&log));
@@ -134,6 +140,7 @@ impl Store {
             blobs,
             state,
             branches,
+            subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(()),
         })
     }
@@ -148,16 +155,15 @@ impl Store {
 
         // Open components
         let log = Arc::new(RecordLog::open(config.path.join("records.log"))?);
-        let index = RecordIndex::load(config.path.join("records.idx"))?;
         let blobs = BlobStorage::new(config.path.join("blobs"), config.blob_cache_size)?;
         let mut state = StateManager::load(config.path.join("state.bin"))?;
         let branches = BranchManager::load(config.path.join("branches.bin"))?;
 
+        // Rebuild index from log (O(N) startup, but O(1) sync)
+        let index = RecordIndex::rebuild_from_log(config.path.join("records.idx"), &log)?;
+
         // Connect state manager to log for disk-based traversal
         state.set_log(Arc::clone(&log));
-
-        // Rebuild causation indexes (not persisted)
-        Self::rebuild_causation_indexes(&log, &index)?;
 
         Ok(Self {
             config,
@@ -167,17 +173,9 @@ impl Store {
             blobs,
             state,
             branches,
+            subscriptions: SubscriptionManager::new(),
             write_lock: Mutex::new(()),
         })
-    }
-
-    /// Rebuild caused_by and linked_to indexes from the log.
-    fn rebuild_causation_indexes(log: &RecordLog, index: &RecordIndex) -> Result<()> {
-        for result in log.iter_from(0) {
-            let (_, record) = result?;
-            index.rebuild_causation_for(record.id, &record.caused_by, &record.linked_to);
-        }
-        Ok(())
     }
 
     // --- Record Operations ---
@@ -205,6 +203,10 @@ impl Store {
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
 
+        // Broadcast to subscribers
+        self.subscriptions.broadcast_record(&record);
+        self.subscriptions.broadcast_branch_head(&branch.name, next_seq);
+
         Ok(record)
     }
 
@@ -230,6 +232,65 @@ impl Store {
             .get_offset(branch.id, seq)
             .unwrap_or(0);
         self.log.iter_from(offset)
+    }
+
+    /// Query records in a sequence range with efficient O(log n + k) lookup.
+    ///
+    /// This uses the BTreeMap index to find records without scanning from the start.
+    /// - `from`: Start sequence (inclusive), None for beginning
+    /// - `to`: End sequence (inclusive), None for end
+    /// - `limit`: Maximum records to return
+    /// - `reverse`: If true, return records in descending sequence order
+    /// - `types`: Optional record type filter (applied after fetching)
+    ///
+    /// Returns records matching the criteria.
+    pub fn query_range(
+        &self,
+        from: Option<Sequence>,
+        to: Option<Sequence>,
+        limit: usize,
+        reverse: bool,
+        types: Option<&[String]>,
+    ) -> Result<Vec<Record>> {
+        let branch = self.branches.current_branch();
+
+        // Get offsets from index
+        // Note: We may need to fetch more than `limit` if filtering by type
+        let fetch_limit = if types.is_some() {
+            // Fetch more to account for filtering; will be limited later
+            limit * 4 + 100
+        } else {
+            limit
+        };
+
+        let offsets = self.index.query_range(
+            branch.id,
+            from,
+            to,
+            fetch_limit,
+            reverse,
+        );
+
+        // Read records and filter
+        let mut records = Vec::with_capacity(limit);
+        for (_seq, offset) in offsets {
+            if records.len() >= limit {
+                break;
+            }
+
+            let record = self.log.read_at(offset)?;
+
+            // Apply type filter if specified
+            if let Some(types) = types {
+                if !types.contains(&record.record_type) {
+                    continue;
+                }
+            }
+
+            records.push(record);
+        }
+
+        Ok(records)
     }
 
     // --- Blob Operations ---
@@ -343,6 +404,10 @@ impl Store {
 
         // Update branch head
         self.branches.update_head(branch.id, next_seq)?;
+
+        // Broadcast state delta to subscribers
+        self.subscriptions.broadcast_state_delta(state_id, operation, next_seq);
+        self.subscriptions.broadcast_branch_head(&branch.name, next_seq);
 
         // Auto-snapshot if needed (based on strategy thresholds)
         // Done after indices/branch update so the snapshot sees consistent state
@@ -886,10 +951,14 @@ impl Store {
             self.branches.current_branch()
         };
 
-        let new_branch = self.branches.create_branch(name, from)?;
+        let parent_name = parent.name.clone();
+        let new_branch = self.branches.create_branch(name, Some(&parent_name))?;
 
         // Copy state chain heads from parent to child
         self.state.copy_heads_for_branch(parent.id, new_branch.id);
+
+        // Broadcast branch created
+        self.subscriptions.broadcast_branch_created(&new_branch, Some(parent_name));
 
         Ok(new_branch)
     }
@@ -897,14 +966,26 @@ impl Store {
     /// Create a branch without copying state from parent.
     /// This is useful for creating branches with custom state (e.g., time-travel branching).
     pub fn create_empty_branch(&self, name: &str, from: Option<&str>) -> Result<Branch> {
+        let parent_name = from.map(|n| n.to_string()).or_else(|| {
+            Some(self.branches.current_branch().name.clone())
+        });
         let new_branch = self.branches.create_branch(name, from)?;
+
+        // Broadcast branch created
+        self.subscriptions.broadcast_branch_created(&new_branch, parent_name);
+
         // Don't copy state - let the caller populate state manually
         Ok(new_branch)
     }
 
     /// Create a branch at a specific sequence.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
-        self.branches.create_branch_at(name, from, at)
+        let new_branch = self.branches.create_branch_at(name, from, at)?;
+
+        // Broadcast branch created
+        self.subscriptions.broadcast_branch_created(&new_branch, Some(from.to_string()));
+
+        Ok(new_branch)
     }
 
     /// Switch to a different branch.
@@ -924,7 +1005,12 @@ impl Store {
 
     /// Delete a branch.
     pub fn delete_branch(&self, name: &str) -> Result<()> {
-        self.branches.delete_branch(name)
+        self.branches.delete_branch(name)?;
+
+        // Broadcast branch deleted
+        self.subscriptions.broadcast_branch_deleted(name);
+
+        Ok(())
     }
 
     // --- Store Operations ---
@@ -943,8 +1029,13 @@ impl Store {
     }
 
     /// Sync all data to disk.
+    ///
+    /// This is O(1) - only syncs the log file and small metadata files.
+    /// The record index is not persisted; it's rebuilt from the log on startup.
     pub fn sync(&self) -> Result<()> {
-        self.index.save()?;
+        // Sync the append-only log (O(1) - just fsync)
+        self.log.sync()?;
+        // Sync small metadata files (O(states) and O(branches), typically tiny)
         self.state.save()?;
         self.branches.save()?;
         Ok(())
@@ -967,6 +1058,185 @@ impl Store {
     /// Returns record IDs that have `record_id` in their `linked_to` field.
     pub fn get_links_to(&self, record_id: RecordId) -> Vec<RecordId> {
         self.index.get_linked_to(record_id)
+    }
+
+    // --- Subscription Operations ---
+
+    /// Subscribe to store events.
+    ///
+    /// Returns a handle for receiving events. Call `catch_up_subscription` to
+    /// replay historical data before going live.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let handle = store.subscribe(SubscriptionConfig {
+    ///     filter: SubscriptionFilter::records(),
+    ///     from_sequence: Some(Sequence(100)),
+    ///     ..Default::default()
+    /// });
+    ///
+    /// // Replay historical data
+    /// store.catch_up_subscription(handle.id)?;
+    ///
+    /// // Now receive live events
+    /// while let Ok(event) = handle.recv() {
+    ///     match event {
+    ///         StoreEvent::Record { record } => { /* ... */ }
+    ///         StoreEvent::CaughtUp => { /* now live */ }
+    ///         _ => {}
+    ///     }
+    /// }
+    /// ```
+    pub fn subscribe(&self, config: SubscriptionConfig) -> SubscriptionHandle {
+        self.subscriptions.subscribe(config)
+    }
+
+    /// Unsubscribe and clean up.
+    pub fn unsubscribe(&self, id: SubscriptionId) {
+        self.subscriptions.unsubscribe(id)
+    }
+
+    /// Get the number of active subscriptions.
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.subscription_count()
+    }
+
+    /// Mark a subscription as caught up (for manual catch-up handling).
+    pub fn mark_subscription_caught_up(&self, id: SubscriptionId) -> Result<()> {
+        self.subscriptions.mark_caught_up(id)
+    }
+
+    /// Perform catch-up for a subscription.
+    ///
+    /// If `from_sequence` is set in the config, this replays:
+    /// 1. State snapshots for subscribed states at the starting sequence
+    /// 2. Historical records matching the filter from that sequence
+    ///
+    /// After catch-up completes, the subscription is marked as caught up
+    /// and will receive live events.
+    pub fn catch_up_subscription(&self, id: SubscriptionId) -> Result<()> {
+        let config = self
+            .subscriptions
+            .get_config(id)
+            .ok_or(StoreError::SubscriptionDropped)?;
+
+        // If no from_sequence, just mark as caught up immediately
+        let from_seq = match config.from_sequence {
+            Some(seq) => seq,
+            None => {
+                return self.subscriptions.mark_caught_up(id);
+            }
+        };
+
+        // Send state snapshots for subscribed states
+        if config.filter.include_state_changes {
+            let state_ids = match &config.filter.state_ids {
+                Some(ids) => ids.clone(),
+                None => self.state.state_ids(),
+            };
+
+            for state_id in state_ids {
+                // Get state at the starting sequence, or current state if it didn't exist then
+                let (state_data, snapshot_seq) = match self.get_state_at(&state_id, from_seq)? {
+                    Some(data) => (data, from_seq),
+                    None => {
+                        // State didn't exist at from_seq, try current state
+                        match self.get_state(&state_id)? {
+                            Some(data) => (data, self.current_branch().head),
+                            None => continue, // State doesn't exist at all
+                        }
+                    }
+                };
+
+                // Check size limits and truncate if needed
+                let total_bytes = state_data.len();
+                let (data, truncated, from_index, total_length) =
+                    if total_bytes > config.max_snapshot_bytes {
+                        // Try to parse as JSON array to provide partial data
+                        if let Ok(serde_json::Value::Array(arr)) =
+                            serde_json::from_slice::<serde_json::Value>(&state_data)
+                        {
+                            let total_len = arr.len();
+                            // Send tail of the array that fits
+                            let mut size = 0;
+                            let mut start_idx = total_len;
+                            for (i, item) in arr.iter().rev().enumerate() {
+                                let item_size = serde_json::to_string(item)
+                                    .map(|s| s.len())
+                                    .unwrap_or(0);
+                                if size + item_size > config.max_snapshot_bytes {
+                                    break;
+                                }
+                                size += item_size;
+                                start_idx = total_len - 1 - i;
+                            }
+                            let truncated_arr: Vec<_> = arr[start_idx..].to_vec();
+                            (
+                                serde_json::Value::Array(truncated_arr),
+                                true,
+                                Some(start_idx),
+                                Some(total_len),
+                            )
+                        } else {
+                            // Non-array, just send null and mark truncated
+                            (serde_json::Value::Null, true, None, None)
+                        }
+                    } else {
+                        let json_data: serde_json::Value =
+                            serde_json::from_slice(&state_data).unwrap_or(serde_json::Value::Null);
+                        (json_data, false, None, None)
+                    };
+
+                let event = crate::subscriptions::StoreEvent::StateSnapshot {
+                    state_id,
+                    data,
+                    // Use the sequence where we got the snapshot from
+                    sequence: snapshot_seq,
+                    truncated,
+                    total_bytes,
+                    from_index,
+                    total_length,
+                };
+
+                if !self.subscriptions.send_to(id, event) {
+                    return Err(StoreError::SubscriptionDropped);
+                }
+            }
+        }
+
+        // Replay historical records
+        if config.filter.include_records {
+            let current_branch = self.branches.current_branch();
+            let payload_threshold = 4096; // Same as manager default
+
+            for result in self.iter_from(from_seq) {
+                let (_offset, record) = result?;
+
+                // Skip records not on current branch
+                if record.branch != current_branch.id {
+                    continue;
+                }
+
+                // Apply record type filter
+                if let Some(ref types) = config.filter.record_types {
+                    if !types.contains(&record.record_type) {
+                        continue;
+                    }
+                }
+
+                let summary =
+                    crate::subscriptions::RecordSummary::from_record(&record, payload_threshold);
+                let event = crate::subscriptions::StoreEvent::Record { record: summary };
+
+                if !self.subscriptions.send_to(id, event) {
+                    return Err(StoreError::SubscriptionDropped);
+                }
+            }
+        }
+
+        // Mark as caught up
+        self.subscriptions.mark_caught_up(id)
     }
 
     // --- Private Helpers ---
@@ -1626,5 +1896,135 @@ mod tests {
         assert_eq!(stats.delta_snapshots_since_full, 1);
         assert!(stats.last_full_snapshot_offset.is_none());
         assert!(stats.last_delta_snapshot_offset.is_some());
+    }
+
+    #[test]
+    fn test_subscription_catch_up_records() {
+        use crate::subscriptions::{SubscriptionConfig, SubscriptionFilter, StoreEvent};
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+
+        // Create some records first
+        for i in 1..=5 {
+            store
+                .append(RecordInput::json("message", &serde_json::json!({ "i": i })).unwrap())
+                .unwrap();
+        }
+
+        // Subscribe from sequence 3
+        let config = SubscriptionConfig {
+            filter: SubscriptionFilter::records(),
+            from_sequence: Some(Sequence(3)),
+            ..Default::default()
+        };
+        let handle = store.subscribe(config);
+
+        // Perform catch-up
+        store.catch_up_subscription(handle.id).unwrap();
+
+        // Should receive records 3, 4, 5 (sequences >= 3)
+        let mut received = Vec::new();
+        while let Ok(event) = handle.recv_timeout(Duration::from_millis(50)) {
+            match event {
+                StoreEvent::Record { record } => {
+                    received.push(record.sequence.0);
+                }
+                StoreEvent::CaughtUp => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(received, vec![3, 4, 5]);
+    }
+
+    #[test]
+    fn test_subscription_catch_up_state() {
+        use crate::subscriptions::{SubscriptionConfig, SubscriptionFilter, StoreEvent};
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+
+        // Register and populate state
+        store
+            .register_state(StateRegistration {
+                id: "counter".to_string(),
+                strategy: crate::types::StateStrategy::Snapshot,
+                initial_value: None,
+            })
+            .unwrap();
+
+        // Update state a few times
+        store
+            .update_state("counter", StateOperation::Set(b"10".to_vec()))
+            .unwrap();
+        let seq2 = store
+            .update_state("counter", StateOperation::Set(b"20".to_vec()))
+            .unwrap();
+        store
+            .update_state("counter", StateOperation::Set(b"30".to_vec()))
+            .unwrap();
+
+        // Subscribe to state from seq2
+        let config = SubscriptionConfig {
+            filter: SubscriptionFilter::states(vec!["counter".to_string()]),
+            from_sequence: Some(seq2.sequence),
+            ..Default::default()
+        };
+        let handle = store.subscribe(config);
+
+        // Perform catch-up
+        store.catch_up_subscription(handle.id).unwrap();
+
+        // Should receive state snapshot at seq2 (value 20)
+        let event = handle.recv_timeout(Duration::from_millis(100)).unwrap();
+        match event {
+            StoreEvent::StateSnapshot { state_id, data, .. } => {
+                assert_eq!(state_id, "counter");
+                assert_eq!(data, serde_json::json!(20));
+            }
+            _ => panic!("Expected StateSnapshot, got {:?}", event),
+        }
+
+        // Then CaughtUp
+        let event = handle.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(matches!(event, StoreEvent::CaughtUp));
+    }
+
+    #[test]
+    fn test_subscription_catch_up_no_from_sequence() {
+        use crate::subscriptions::{SubscriptionConfig, SubscriptionFilter, StoreEvent};
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let store = Store::create(test_config(&dir)).unwrap();
+
+        // Create some records
+        for i in 1..=3 {
+            store
+                .append(RecordInput::json("message", &serde_json::json!({ "i": i })).unwrap())
+                .unwrap();
+        }
+
+        // Subscribe without from_sequence (live only)
+        let config = SubscriptionConfig {
+            filter: SubscriptionFilter::records(),
+            from_sequence: None,
+            ..Default::default()
+        };
+        let handle = store.subscribe(config);
+
+        // Perform catch-up (should immediately mark as caught up)
+        store.catch_up_subscription(handle.id).unwrap();
+
+        // Should receive CaughtUp immediately, no historical records
+        let event = handle.recv_timeout(Duration::from_millis(100)).unwrap();
+        assert!(matches!(event, StoreEvent::CaughtUp));
+
+        // No more events
+        let result = handle.recv_timeout(Duration::from_millis(50));
+        assert!(result.is_err());
     }
 }

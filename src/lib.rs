@@ -40,6 +40,7 @@ pub mod napi;
 pub mod records;
 pub mod state;
 pub mod store;
+pub mod subscriptions;
 pub mod types;
 pub mod wal;
 
@@ -53,5 +54,9 @@ pub use state::{
     StateManager,
 };
 pub use store::{CompactionSummary, Store, StoreConfig};
+pub use subscriptions::{
+    BranchSummary, DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
+    SubscriptionHandle, SubscriptionId, SubscriptionManager,
+};
 pub use types::*;
 pub use wal::{WalEntry, WalEntryStatus, WalOperation, WriteAheadLog};

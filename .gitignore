@@ -12,6 +12,8 @@ index.js
 
 # Test artifacts
 test-store/
+test-ui-store/
+server/test-ui-store/
 
 # IDE
 .idea/
@@ -21,3 +23,4 @@ test-store/
 
 # OS
 .DS_Store
+server/dist

@@ -11,7 +11,7 @@
 //! NOTE: The Store auto-snapshots after each update when thresholds are reached,
 //! so `snapshot_needed()` typically returns None after an update.
 
-use record_store::{
+use chronicle::{
     StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use tempfile::TempDir;

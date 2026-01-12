@@ -7,7 +7,7 @@
 //! 4. Branch deletion properly handles state
 //! 5. Empty branches work correctly
 
-use record_store::{
+use chronicle::{
     StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use tempfile::TempDir;

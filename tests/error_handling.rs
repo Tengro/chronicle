@@ -1,6 +1,6 @@
 //! Error handling and edge case tests.
 
-use record_store::{
+use chronicle::{
     RecordId, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig, StoreError,
 };
 use tempfile::TempDir;
@@ -141,7 +141,7 @@ fn test_get_nonexistent_blob() {
     let dir = TempDir::new().unwrap();
     let store = test_store(&dir);
 
-    let hash = record_store::Hash::from_bytes(b"nonexistent");
+    let hash = chronicle::Hash::from_bytes(b"nonexistent");
     let result = store.get_blob(&hash).unwrap();
     assert!(result.is_none());
 }
@@ -246,7 +246,7 @@ fn test_empty_record_payload() {
     let dir = TempDir::new().unwrap();
     let store = test_store(&dir);
 
-    use record_store::RecordInput;
+    use chronicle::RecordInput;
 
     let record = store
         .append(RecordInput::raw("empty", vec![]))

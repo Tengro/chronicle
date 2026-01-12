@@ -1,6 +1,6 @@
 //! Integration tests for the record store.
 
-use record_store::{
+use chronicle::{
     RecordInput, Sequence, StateOperation, StateRegistration, StateStrategy, Store, StoreConfig,
 };
 use serde_json::json;
@@ -132,7 +132,7 @@ fn test_code_storage_and_retrieval() {
     let payload: serde_json::Value = serde_json::from_slice(&retrieved.payload).unwrap();
 
     let main_blob = store
-        .get_blob(&record_store::Hash::from_hex(&payload["main"].as_str().unwrap()).unwrap())
+        .get_blob(&chronicle::Hash::from_hex(&payload["main"].as_str().unwrap()).unwrap())
         .unwrap()
         .unwrap();
     assert_eq!(main_blob.content, js_code);

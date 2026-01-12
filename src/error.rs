@@ -62,6 +62,9 @@ pub enum StoreError {
 
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    #[error("Subscription was dropped")]
+    SubscriptionDropped,
 }
 
 impl From<serde_json::Error> for StoreError {

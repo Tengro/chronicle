@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+/* Custom styles for Chronicle UI */
+body {
+  background-color: #f9fafb;
+  color: #111827;
+}
+
+#app {
+  min-height: 100vh;
+}

@@ -1,17 +1,26 @@
 //! NAPI bindings for Node.js/TypeScript.
 
 use crate::{
-    error::StoreError, CompactionSummary, Record, RecordId, Sequence, StateOperation,
-    StateRegistration, StateStrategy, Store, StoreConfig,
+    error::StoreError,
+    subscriptions::{
+        DropReason, RecordSummary, StoreEvent, SubscriptionConfig, SubscriptionFilter,
+        SubscriptionHandle, SubscriptionId,
+    },
+    CompactionSummary, Record, RecordId, Sequence, StateOperation, StateRegistration,
+    StateStrategy, Store, StoreConfig,
 };
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// JavaScript-friendly Store wrapper.
 #[napi]
 pub struct JsStore {
     inner: Option<Arc<Store>>,
+    /// Active subscription handles, stored by ID.
+    subscription_handles: Mutex<HashMap<u64, SubscriptionHandle>>,
 }
 
 /// Record returned to JavaScript.
@@ -123,6 +132,8 @@ pub struct JsQueryFilter {
     pub to_sequence: Option<i64>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+    /// If true, return records in descending sequence order (newest first).
+    pub reverse: Option<bool>,
 }
 
 /// State info returned to JavaScript.
@@ -132,6 +143,68 @@ pub struct JsStateInfo {
     pub strategy: String,
     pub item_count: Option<i64>,
     pub ops_since_snapshot: i64,
+}
+
+// --- Subscription types ---
+
+/// Configuration for creating a subscription.
+#[napi(object)]
+pub struct JsSubscriptionConfig {
+    /// Max buffered events before dropping subscriber (default: 1000).
+    pub buffer_size: Option<i64>,
+    /// Max bytes for state snapshots (default: 10MB).
+    pub max_snapshot_bytes: Option<i64>,
+    /// Starting sequence for catch-up (None = live only).
+    pub from_sequence: Option<i64>,
+    /// Filter criteria.
+    pub filter: Option<JsSubscriptionFilter>,
+}
+
+/// Filter criteria for subscriptions.
+#[napi(object)]
+pub struct JsSubscriptionFilter {
+    /// Filter by record types (None = all).
+    pub record_types: Option<Vec<String>>,
+    /// Filter by branch name.
+    pub branch: Option<String>,
+    /// Subscribe to specific state IDs.
+    pub state_ids: Option<Vec<String>>,
+    /// Include record events.
+    pub include_records: Option<bool>,
+    /// Include state change events.
+    pub include_state_changes: Option<bool>,
+    /// Include branch events.
+    pub include_branch_events: Option<bool>,
+}
+
+/// A store event.
+#[napi(object)]
+pub struct JsStoreEvent {
+    /// Event type: "record", "state_snapshot", "state_delta", "branch_head",
+    /// "branch_created", "branch_deleted", "caught_up", "dropped"
+    pub event_type: String,
+    /// JSON-serialized event data.
+    pub data: String,
+}
+
+impl From<StoreEvent> for JsStoreEvent {
+    fn from(event: StoreEvent) -> Self {
+        let event_type = match &event {
+            StoreEvent::Record { .. } => "record",
+            StoreEvent::StateSnapshot { .. } => "state_snapshot",
+            StoreEvent::StateDelta { .. } => "state_delta",
+            StoreEvent::BranchHead { .. } => "branch_head",
+            StoreEvent::BranchCreated { .. } => "branch_created",
+            StoreEvent::BranchDeleted { .. } => "branch_deleted",
+            StoreEvent::CaughtUp => "caught_up",
+            StoreEvent::Dropped { .. } => "dropped",
+        };
+        let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+        JsStoreEvent {
+            event_type: event_type.to_string(),
+            data,
+        }
+    }
 }
 
 impl From<CompactionSummary> for JsCompactionSummary {
@@ -170,6 +243,7 @@ impl JsStore {
         let store = Store::create(store_config).map_err(to_napi_error)?;
         Ok(JsStore {
             inner: Some(Arc::new(store)),
+            subscription_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -184,6 +258,7 @@ impl JsStore {
         let store = Store::open(store_config).map_err(to_napi_error)?;
         Ok(JsStore {
             inner: Some(Arc::new(store)),
+            subscription_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -198,6 +273,7 @@ impl JsStore {
         let store = Store::open_or_create(store_config).map_err(to_napi_error)?;
         Ok(JsStore {
             inner: Some(Arc::new(store)),
+            subscription_handles: Mutex::new(HashMap::new()),
         })
     }
 
@@ -657,52 +733,51 @@ impl JsStore {
     }
 
     /// Query records with filters.
+    ///
+    /// Uses efficient BTreeMap-based range queries for O(log n + k) performance.
+    /// - `from_sequence`: Start sequence (inclusive)
+    /// - `to_sequence`: End sequence (inclusive)
+    /// - `limit`: Maximum records to return
+    /// - `offset`: Skip first N records (note: offset is less efficient than sequence-based pagination)
+    /// - `reverse`: Return records in descending sequence order (newest first)
+    /// - `types`: Filter by record types
     #[napi]
     pub fn query(&self, filter: JsQueryFilter) -> Result<Vec<JsRecord>> {
         let store = self.get_store()?;
-        let from_seq = filter.from_sequence.map(|s| s as u64).unwrap_or(0);
-        let to_seq = filter.to_sequence.map(|s| s as u64);
-        let limit = filter.limit.map(|l| l as usize);
+        let from_seq = filter.from_sequence.map(|s| Sequence(s as u64));
+        let to_seq = filter.to_sequence.map(|s| Sequence(s as u64));
+        let limit = filter.limit.map(|l| l as usize).unwrap_or(usize::MAX);
         let offset = filter.offset.map(|o| o as usize).unwrap_or(0);
+        let reverse = filter.reverse.unwrap_or(false);
         let types = filter.types;
 
-        let mut records = Vec::new();
-        let mut skipped = 0;
+        // For offset-based pagination, we need to fetch offset + limit records
+        // This is less efficient than sequence-based pagination, but maintains backward compatibility
+        let fetch_limit = if offset > 0 {
+            offset.saturating_add(limit)
+        } else {
+            limit
+        };
 
-        for result in store.iter_from(Sequence(from_seq)) {
-            let (_, record) = result.map_err(to_napi_error)?;
+        let records = store
+            .query_range(
+                from_seq,
+                to_seq,
+                fetch_limit,
+                reverse,
+                types.as_ref().map(|v| v.as_slice()),
+            )
+            .map_err(to_napi_error)?;
 
-            // Check sequence bound
-            if let Some(to) = to_seq {
-                if record.sequence.0 > to {
-                    break;
-                }
-            }
+        // Apply offset (skip first N)
+        let result: Vec<JsRecord> = records
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| r.into())
+            .collect();
 
-            // Check type filter
-            if let Some(ref type_filter) = types {
-                if !type_filter.contains(&record.record_type) {
-                    continue;
-                }
-            }
-
-            // Handle offset
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-
-            records.push(record.into());
-
-            // Handle limit
-            if let Some(max) = limit {
-                if records.len() >= max {
-                    break;
-                }
-            }
-        }
-
-        Ok(records)
+        Ok(result)
     }
 
     /// List all registered states with their info.
@@ -807,5 +882,139 @@ impl JsStore {
     pub fn sync(&self) -> Result<()> {
         let store = self.get_store()?;
         store.sync().map_err(to_napi_error)
+    }
+
+    // --- Subscription Methods ---
+
+    /// Subscribe to store events.
+    ///
+    /// Returns a subscription ID. Use `poll_subscription` to receive events
+    /// and `catch_up_subscription` to replay historical data.
+    #[napi]
+    pub fn subscribe(&self, config: Option<JsSubscriptionConfig>) -> Result<String> {
+        let store = self.get_store()?;
+
+        // Convert JS config to Rust config
+        let rust_config = match config {
+            Some(cfg) => {
+                let filter = cfg.filter.map(|f| SubscriptionFilter {
+                    record_types: f.record_types,
+                    branch: f.branch,
+                    state_ids: f.state_ids,
+                    include_records: f.include_records.unwrap_or(false),
+                    include_state_changes: f.include_state_changes.unwrap_or(false),
+                    include_branch_events: f.include_branch_events.unwrap_or(false),
+                });
+
+                SubscriptionConfig {
+                    buffer_size: cfg.buffer_size.map(|s| s as usize).unwrap_or(1000),
+                    max_snapshot_bytes: cfg
+                        .max_snapshot_bytes
+                        .map(|s| s as usize)
+                        .unwrap_or(10 * 1024 * 1024),
+                    from_sequence: cfg.from_sequence.map(|s| Sequence(s as u64)),
+                    filter: filter.unwrap_or_default(),
+                }
+            }
+            None => SubscriptionConfig::default(),
+        };
+
+        let handle = store.subscribe(rust_config);
+        let id = handle.id.0;
+
+        // Store the handle for later polling
+        self.subscription_handles.lock().insert(id, handle);
+
+        Ok(id.to_string())
+    }
+
+    /// Unsubscribe and clean up a subscription.
+    #[napi]
+    pub fn unsubscribe(&self, subscription_id: String) -> Result<()> {
+        let store = self.get_store()?;
+        let id: u64 = subscription_id
+            .parse()
+            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+
+        // Remove handle from our map
+        self.subscription_handles.lock().remove(&id);
+
+        // Unsubscribe from store
+        store.unsubscribe(SubscriptionId(id));
+        Ok(())
+    }
+
+    /// Perform catch-up for a subscription (replay historical data).
+    ///
+    /// This replays state snapshots and historical records based on the
+    /// subscription's `from_sequence` setting.
+    #[napi]
+    pub fn catch_up_subscription(&self, subscription_id: String) -> Result<()> {
+        let store = self.get_store()?;
+        let id: u64 = subscription_id
+            .parse()
+            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+
+        store
+            .catch_up_subscription(SubscriptionId(id))
+            .map_err(to_napi_error)
+    }
+
+    /// Poll for the next event from a subscription (non-blocking).
+    ///
+    /// Returns null if no events are available.
+    #[napi]
+    pub fn poll_subscription(&self, subscription_id: String) -> Result<Option<JsStoreEvent>> {
+        let id: u64 = subscription_id
+            .parse()
+            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+
+        let handles = self.subscription_handles.lock();
+        let handle = handles
+            .get(&id)
+            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+
+        match handle.try_recv() {
+            Ok(event) => Ok(Some(event.into())),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                Err(napi::Error::from_reason("Subscription disconnected"))
+            }
+        }
+    }
+
+    /// Poll for the next event with a timeout (milliseconds).
+    ///
+    /// Returns null if no event received within the timeout.
+    #[napi]
+    pub fn poll_subscription_timeout(
+        &self,
+        subscription_id: String,
+        timeout_ms: i64,
+    ) -> Result<Option<JsStoreEvent>> {
+        let id: u64 = subscription_id
+            .parse()
+            .map_err(|_| napi::Error::from_reason("Invalid subscription ID"))?;
+
+        let handles = self.subscription_handles.lock();
+        let handle = handles
+            .get(&id)
+            .ok_or_else(|| napi::Error::from_reason("Subscription not found"))?;
+
+        let timeout = std::time::Duration::from_millis(timeout_ms as u64);
+        match handle.recv_timeout(timeout) {
+            Ok(event) => Ok(Some(event.into())),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                Err(napi::Error::from_reason("Subscription disconnected"))
+            }
+        }
+    }
+
+    /// Get the number of active subscriptions.
+    #[napi]
+    pub fn subscription_count(&self) -> Result<i64> {
+        let store = self.get_store()?;
+        Ok(store.subscription_count() as i64)
     }
 }
