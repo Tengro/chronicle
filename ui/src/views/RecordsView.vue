@@ -23,7 +23,8 @@ function formatPayload(payload: unknown): string {
 }
 
 function formatTimestamp(ts: number): string {
-  return new Date(ts).toLocaleString();
+  // Chronicle stores timestamps as microseconds, JS Date expects milliseconds
+  return new Date(ts / 1000).toLocaleString();
 }
 
 function handleTypeChange(event: Event) {

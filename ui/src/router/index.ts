@@ -1,7 +1,9 @@
-import { createRouter, createWebHistory } from 'vue-router';
+import { createRouter, createWebHashHistory } from 'vue-router';
 
+// Use hash-based routing so the UI can be mounted at any path (e.g., /chronicle)
+// Routes become: /chronicle/#/states, /chronicle/#/branches, etc.
 const router = createRouter({
-  history: createWebHistory(import.meta.env.BASE_URL),
+  history: createWebHashHistory(),
   routes: [
     {
       path: '/',

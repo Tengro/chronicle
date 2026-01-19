@@ -5,7 +5,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && npm run build:ui",
+    "build:server": "tsc",
+    "build:ui": "cd ../ui && npm install && npm run build-only && cp -r dist ../server/dist/static",
     "dev": "tsc --watch"
   },
   "dependencies": {

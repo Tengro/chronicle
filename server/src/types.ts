@@ -165,4 +165,6 @@ export interface ChronicleUIOptions {
   cors?: boolean;
   /** Enable request logging (default: false) */
   logging?: boolean;
+  /** Serve the web UI (default: true). Set to false for API-only mode. */
+  serveUI?: boolean;
 }
