@@ -52,7 +52,7 @@ export function createChronicleUI(
   store: JsStore,
   options: ChronicleUIOptions = {}
 ): { router: Router; wss: WebSocketServer } {
-  const { apiPath = '/api', cors = true, logging = false } = options;
+  const { apiPath = '/api', cors = true, logging = false, serveUI = true } = options;
 
   const router = Router();
 
@@ -87,26 +87,27 @@ export function createChronicleUI(
   router.use(`${apiPath}/records`, createRecordRoutes(store));
   router.use(`${apiPath}/states`, createStateRoutes(store));
 
-  // Serve static UI files (if built)
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = dirname(__filename);
-  const staticPath = join(__dirname, 'static');
+  // Serve static UI files (if enabled and built)
+  if (serveUI) {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    const staticPath = join(__dirname, 'static');
 
-  if (existsSync(staticPath)) {
-    router.use(express.static(staticPath));
+    if (existsSync(staticPath)) {
+      router.use(express.static(staticPath));
 
-    // SPA fallback - serve index.html for all non-API routes
-    router.get('*', (req, res, next) => {
-      if (req.path.startsWith(apiPath)) {
-        next();
-        return;
-      }
-      res.sendFile(join(staticPath, 'index.html'));
-    });
-  } else {
-    // No UI built yet - show placeholder
-    router.get('/', (_req, res) => {
-      res.send(`
+      // SPA fallback - serve index.html for all non-API routes
+      router.get('*', (req, res, next) => {
+        if (req.path.startsWith(apiPath)) {
+          next();
+          return;
+        }
+        res.sendFile(join(staticPath, 'index.html'));
+      });
+    } else {
+      // No UI built yet - show placeholder
+      router.get('/', (_req, res) => {
+        res.send(`
         <!DOCTYPE html>
         <html>
         <head>
@@ -130,7 +131,8 @@ export function createChronicleUI(
         </body>
         </html>
       `);
-    });
+      });
+    }
   }
 
   // Create WebSocket handler

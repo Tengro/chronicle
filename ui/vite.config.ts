@@ -6,6 +6,8 @@ import vueDevTools from 'vite-plugin-vue-devtools'
 
 // https://vite.dev/config/
 export default defineConfig({
+  // Use relative paths so the UI can be mounted at any base path (e.g., /chronicle)
+  base: './',
   plugins: [
     vue(),
     vueDevTools(),

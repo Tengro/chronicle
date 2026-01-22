@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue';
 import { client } from '@/api/client';
 import { useChronicleWebSocket } from '@/api/websocket';
+import JsonViewer from '@/components/JsonViewer.vue';
 
 const props = defineProps<{
   stateId: string;
@@ -36,6 +37,23 @@ const ws = useChronicleWebSocket();
 const scrollContainer = ref<HTMLElement | null>(null);
 const sentinel = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
+
+// Track expanded items (by index)
+const expandedItems = ref<Set<number>>(new Set());
+
+function toggleExpand(idx: number) {
+  if (expandedItems.value.has(idx)) {
+    expandedItems.value.delete(idx);
+  } else {
+    expandedItems.value.add(idx);
+  }
+  // Trigger reactivity
+  expandedItems.value = new Set(expandedItems.value);
+}
+
+function isExpanded(idx: number): boolean {
+  return expandedItems.value.has(idx);
+}
 
 // Format timestamp
 function formatTime(ts?: number): string {
@@ -334,17 +352,26 @@ onUnmounted(() => {
         <div
           v-for="(item, idx) in items"
           :key="idx"
-          class="flex items-start gap-3 px-3 py-1.5 hover:bg-gray-50 border-b border-gray-100"
+          class="border-b border-gray-100"
         >
-          <span class="text-gray-400 text-xs w-16 shrink-0">{{ formatTime(item.timestamp) }}</span>
-          <span
-            v-if="item.type"
-            class="text-xs px-1.5 py-0.5 rounded font-medium w-14 text-center shrink-0"
-            :class="getTypeColor(item.type)"
+          <div
+            class="flex items-start gap-3 px-3 py-1.5 hover:bg-gray-50 cursor-pointer"
+            @click="toggleExpand(idx)"
           >
-            {{ item.type }}
-          </span>
-          <span class="text-gray-700 break-all">{{ item.message || JSON.stringify(item) }}</span>
+            <span class="text-gray-400 select-none w-4 shrink-0">{{ isExpanded(idx) ? '\u25bc' : '\u25b6' }}</span>
+            <span class="text-gray-400 text-xs w-16 shrink-0">{{ formatTime(item.timestamp) }}</span>
+            <span
+              v-if="item.type"
+              class="text-xs px-1.5 py-0.5 rounded font-medium w-14 text-center shrink-0"
+              :class="getTypeColor(item.type)"
+            >
+              {{ item.type }}
+            </span>
+            <span class="text-gray-700 flex-1 truncate">{{ item.message || JSON.stringify(item) }}</span>
+          </div>
+          <div v-if="isExpanded(idx)" class="px-3 pb-3 pt-1 ml-7">
+            <JsonViewer :data="item" />
+          </div>
         </div>
 
         <!-- Sentinel for infinite scroll -->
@@ -364,18 +391,27 @@ onUnmounted(() => {
           <div
             v-for="result in searchResults"
             :key="result.index"
-            class="flex items-start gap-3 px-3 py-1.5 hover:bg-gray-50 border-b border-gray-100"
+            class="border-b border-gray-100"
           >
-            <span class="text-gray-400 text-xs w-10 shrink-0 text-right">#{{ result.index }}</span>
-            <span class="text-gray-400 text-xs w-16 shrink-0">{{ formatTime(result.item.timestamp) }}</span>
-            <span
-              v-if="result.item.type"
-              class="text-xs px-1.5 py-0.5 rounded font-medium w-14 text-center shrink-0"
-              :class="getTypeColor(result.item.type)"
+            <div
+              class="flex items-start gap-3 px-3 py-1.5 hover:bg-gray-50 cursor-pointer"
+              @click="toggleExpand(result.index + 100000)"
             >
-              {{ result.item.type }}
-            </span>
-            <span class="text-gray-700 break-all">{{ result.item.message || JSON.stringify(result.item) }}</span>
+              <span class="text-gray-400 select-none w-4 shrink-0">{{ isExpanded(result.index + 100000) ? '\u25bc' : '\u25b6' }}</span>
+              <span class="text-gray-400 text-xs w-10 shrink-0 text-right">#{{ result.index }}</span>
+              <span class="text-gray-400 text-xs w-16 shrink-0">{{ formatTime(result.item.timestamp) }}</span>
+              <span
+                v-if="result.item.type"
+                class="text-xs px-1.5 py-0.5 rounded font-medium w-14 text-center shrink-0"
+                :class="getTypeColor(result.item.type)"
+              >
+                {{ result.item.type }}
+              </span>
+              <span class="text-gray-700 flex-1 truncate">{{ result.item.message || JSON.stringify(result.item) }}</span>
+            </div>
+            <div v-if="isExpanded(result.index + 100000)" class="px-3 pb-3 pt-1 ml-7">
+              <JsonViewer :data="result.item" />
+            </div>
           </div>
         </div>
         <div v-else-if="searchQuery && !searchLoading" class="p-8 text-center text-gray-500">

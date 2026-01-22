@@ -34,7 +34,18 @@ export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'er
 // WebSocket Manager
 // ============================================================================
 
-const WS_URL = import.meta.env.VITE_WS_URL || `ws://${window.location.host}/ws`;
+// Construct WebSocket URL relative to current location (works when mounted at any base path)
+function getWebSocketUrl(): string {
+  if (import.meta.env.VITE_WS_URL) {
+    return import.meta.env.VITE_WS_URL;
+  }
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  // Get the base path from current location, append /ws
+  const basePath = window.location.pathname.replace(/\/$/, '');
+  return `${protocol}//${window.location.host}${basePath}/ws`;
+}
+
+const WS_URL = getWebSocketUrl();
 
 export function useChronicleWebSocket() {
   const status = ref<ConnectionStatus>('disconnected');

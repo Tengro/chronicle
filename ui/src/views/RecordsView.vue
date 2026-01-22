@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, watch, ref, nextTick, onUnmounted } from 'vue';
+import { onMounted, watch, ref, nextTick, onUnmounted, computed } from 'vue';
 import { useRecordsStore } from '@/stores/records';
 import { useBranchesStore } from '@/stores/branches';
+import JsonViewer from '@/components/JsonViewer.vue';
 
 const recordsStore = useRecordsStore();
 const branchesStore = useBranchesStore();
@@ -10,20 +11,87 @@ const scrollContainer = ref<HTMLElement | null>(null);
 const sentinel = ref<HTMLElement | null>(null);
 let observer: IntersectionObserver | null = null;
 
+// Resizable detail panel
+const detailPanelHeight = ref(256);
+const isResizing = ref(false);
+const minPanelHeight = 100;
+const maxPanelHeight = 600;
+
+function startResize(e: MouseEvent) {
+  isResizing.value = true;
+  const startY = e.clientY;
+  const startHeight = detailPanelHeight.value;
+
+  function onMouseMove(e: MouseEvent) {
+    const delta = startY - e.clientY;
+    detailPanelHeight.value = Math.min(maxPanelHeight, Math.max(minPanelHeight, startHeight + delta));
+  }
+
+  function onMouseUp() {
+    isResizing.value = false;
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+  }
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+}
+
+// Decode a byte array to string, attempting JSON parse for pretty formatting
+function decodeBytes(bytes: number[]): unknown {
+  try {
+    const str = new TextDecoder().decode(new Uint8Array(bytes));
+    try {
+      return JSON.parse(str);
+    } catch {
+      return str;
+    }
+  } catch {
+    return bytes;
+  }
+}
+
+// Recursively decode byte arrays in operation objects
+function decodeOperations(obj: unknown): unknown {
+  if (obj === null || obj === undefined) return obj;
+  if (Array.isArray(obj)) {
+    // Check if it's a byte array (all numbers 0-255)
+    if (obj.length > 0 && obj.every(v => typeof v === 'number' && v >= 0 && v <= 255)) {
+      return decodeBytes(obj);
+    }
+    return obj.map(decodeOperations);
+  }
+  if (typeof obj === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(obj)) {
+      // Decode operation payloads
+      if ((key === 'Set' || key === 'Append' || key === 'Merge') && Array.isArray(value)) {
+        result[key] = decodeBytes(value as number[]);
+      } else {
+        result[key] = decodeOperations(value);
+      }
+    }
+    return result;
+  }
+  return obj;
+}
+
 function formatPayload(payload: unknown): string {
   if (typeof payload === 'string') return payload;
   if (payload instanceof ArrayBuffer || ArrayBuffer.isView(payload)) {
     return `[Binary: ${(payload as ArrayBuffer).byteLength || (payload as Uint8Array).length} bytes]`;
   }
   try {
-    return JSON.stringify(payload, null, 2);
+    const decoded = decodeOperations(payload);
+    return JSON.stringify(decoded, null, 2);
   } catch {
     return String(payload);
   }
 }
 
 function formatTimestamp(ts: number): string {
-  return new Date(ts).toLocaleString();
+  // Chronicle stores timestamps as microseconds, JS Date expects milliseconds
+  return new Date(ts / 1000).toLocaleString();
 }
 
 function handleTypeChange(event: Event) {
@@ -66,6 +134,18 @@ onUnmounted(() => {
 // Refetch when branch changes
 watch(() => branchesStore.currentBranch, () => {
   recordsStore.fetchRecords();
+});
+
+// Decoded payload for the selected record (for JsonViewer)
+const selectedPayloadDecoded = computed(() => {
+  if (!recordsStore.selectedRecord) return null;
+  return decodeOperations(recordsStore.selectedRecord.payload);
+});
+
+// Raw payload text for toggle
+const selectedPayloadRaw = computed(() => {
+  if (!recordsStore.selectedRecord) return '';
+  return formatPayload(recordsStore.selectedRecord.payload);
 });
 </script>
 
@@ -150,8 +230,14 @@ watch(() => branchesStore.currentBranch, () => {
     </div>
 
     <!-- Detail Panel -->
-    <div v-if="recordsStore.selectedRecord" class="border-t border-gray-200 bg-white h-64 overflow-auto">
-      <div class="p-4">
+    <div v-if="recordsStore.selectedRecord" class="border-t border-gray-200 bg-white flex flex-col" :style="{ height: detailPanelHeight + 'px' }">
+      <!-- Resize Handle -->
+      <div
+        @mousedown="startResize"
+        class="h-1.5 cursor-ns-resize bg-gray-200 hover:bg-blue-400 transition-colors flex-shrink-0"
+        :class="isResizing ? 'bg-blue-500' : ''"
+      />
+      <div class="p-4 overflow-auto flex-1">
         <div class="flex items-center justify-between mb-3">
           <h3 class="font-semibold text-gray-900">Record Details</h3>
           <button
@@ -189,9 +275,11 @@ watch(() => branchesStore.currentBranch, () => {
             <span class="ml-2 font-mono">{{ recordsStore.selectedRecord.linkedTo.join(', ') }}</span>
           </div>
         </div>
-        <div class="mt-4">
-          <span class="text-gray-500 text-sm">Payload:</span>
-          <pre class="mt-1 p-3 bg-gray-100 rounded text-xs font-mono overflow-auto max-h-32">{{ formatPayload(recordsStore.selectedRecord.payload) }}</pre>
+        <div class="mt-4 flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
+          <span class="text-gray-500 text-sm mb-1">Payload:</span>
+          <div class="flex-1 min-w-0 overflow-auto">
+            <JsonViewer :data="selectedPayloadDecoded" :raw-text="selectedPayloadRaw" />
+          </div>
         </div>
       </div>
     </div>

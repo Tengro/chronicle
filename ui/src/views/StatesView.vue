@@ -3,6 +3,7 @@ import { onMounted, ref, watch, computed } from 'vue';
 import { useStatesStore } from '@/stores/states';
 import { useBranchesStore } from '@/stores/branches';
 import AppendLogViewer from '@/components/AppendLogViewer.vue';
+import JsonViewer from '@/components/JsonViewer.vue';
 
 const statesStore = useStatesStore();
 const branchesStore = useBranchesStore();
@@ -16,16 +17,6 @@ const isAppendLog = computed(() => {
 const historySequence = ref<number | null>(null);
 const historyValue = ref<unknown>(null);
 const loadingHistory = ref(false);
-
-function formatValue(value: unknown): string {
-  if (value === null || value === undefined) return 'null';
-  if (typeof value === 'string') return value;
-  try {
-    return JSON.stringify(value, null, 2);
-  } catch {
-    return String(value);
-  }
-}
 
 async function loadAtSequence() {
   if (!statesStore.selectedState || historySequence.value === null) return;
@@ -95,7 +86,7 @@ watch(() => statesStore.selectedState, () => {
     </div>
 
     <!-- State Detail -->
-    <div class="flex-1 flex flex-col">
+    <div class="flex-1 min-w-0 flex flex-col">
       <template v-if="statesStore.selectedState">
         <!-- AppendLog Viewer for append_log states -->
         <template v-if="isAppendLog">
@@ -124,7 +115,7 @@ watch(() => statesStore.selectedState, () => {
           <div class="flex-1 overflow-auto p-4">
             <div class="mb-4">
               <h3 class="text-sm font-medium text-gray-700 mb-2">Current Value</h3>
-              <pre class="p-3 bg-gray-100 rounded text-sm font-mono overflow-auto max-h-64">{{ formatValue(statesStore.selectedState.value) }}</pre>
+              <JsonViewer :data="statesStore.selectedState.value" />
             </div>
 
             <!-- Historical Access -->
@@ -147,7 +138,9 @@ watch(() => statesStore.selectedState, () => {
                   {{ loadingHistory ? 'Loading...' : 'Load' }}
                 </button>
               </div>
-              <pre v-if="historyValue !== null" class="p-3 bg-gray-100 rounded text-sm font-mono overflow-auto max-h-64">{{ formatValue(historyValue) }}</pre>
+              <div v-if="historyValue !== null">
+                <JsonViewer :data="historyValue" />
+              </div>
               <div v-else class="text-sm text-gray-500">
                 Enter a sequence number to view historical state
               </div>

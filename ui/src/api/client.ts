@@ -2,8 +2,8 @@
  * Chronicle API Client
  */
 
-// Base URL - can be configured for different environments
-const BASE_URL = import.meta.env.VITE_API_URL || '/api';
+// Base URL - use relative path so it works when mounted at any base path
+const BASE_URL = import.meta.env.VITE_API_URL || './api';
 
 // ============================================================================
 // Types
