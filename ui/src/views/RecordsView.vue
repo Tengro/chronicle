@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { onMounted, watch, ref, nextTick, onUnmounted } from 'vue';
+import { onMounted, watch, ref, nextTick, onUnmounted, computed } from 'vue';
 import { useRecordsStore } from '@/stores/records';
 import { useBranchesStore } from '@/stores/branches';
+import JsonViewer from '@/components/JsonViewer.vue';
 
 const recordsStore = useRecordsStore();
 const branchesStore = useBranchesStore();
@@ -134,6 +135,18 @@ onUnmounted(() => {
 watch(() => branchesStore.currentBranch, () => {
   recordsStore.fetchRecords();
 });
+
+// Decoded payload for the selected record (for JsonViewer)
+const selectedPayloadDecoded = computed(() => {
+  if (!recordsStore.selectedRecord) return null;
+  return decodeOperations(recordsStore.selectedRecord.payload);
+});
+
+// Raw payload text for toggle
+const selectedPayloadRaw = computed(() => {
+  if (!recordsStore.selectedRecord) return '';
+  return formatPayload(recordsStore.selectedRecord.payload);
+});
 </script>
 
 <template>
@@ -262,9 +275,11 @@ watch(() => branchesStore.currentBranch, () => {
             <span class="ml-2 font-mono">{{ recordsStore.selectedRecord.linkedTo.join(', ') }}</span>
           </div>
         </div>
-        <div class="mt-4 flex-1 flex flex-col min-h-0">
-          <span class="text-gray-500 text-sm">Payload:</span>
-          <pre class="mt-1 p-3 bg-gray-100 rounded text-xs font-mono overflow-auto flex-1">{{ formatPayload(recordsStore.selectedRecord.payload) }}</pre>
+        <div class="mt-4 flex-1 flex flex-col min-h-0 overflow-hidden">
+          <span class="text-gray-500 text-sm mb-1">Payload:</span>
+          <div class="flex-1 overflow-auto">
+            <JsonViewer :data="selectedPayloadDecoded" :raw-text="selectedPayloadRaw" />
+          </div>
         </div>
       </div>
     </div>
