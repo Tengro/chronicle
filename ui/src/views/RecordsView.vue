@@ -275,9 +275,9 @@ const selectedPayloadRaw = computed(() => {
             <span class="ml-2 font-mono">{{ recordsStore.selectedRecord.linkedTo.join(', ') }}</span>
           </div>
         </div>
-        <div class="mt-4 flex-1 flex flex-col min-h-0 overflow-hidden">
+        <div class="mt-4 flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden">
           <span class="text-gray-500 text-sm mb-1">Payload:</span>
-          <div class="flex-1 overflow-auto">
+          <div class="flex-1 min-w-0 overflow-auto">
             <JsonViewer :data="selectedPayloadDecoded" :raw-text="selectedPayloadRaw" />
           </div>
         </div>

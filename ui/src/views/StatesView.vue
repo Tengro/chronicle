@@ -86,7 +86,7 @@ watch(() => statesStore.selectedState, () => {
     </div>
 
     <!-- State Detail -->
-    <div class="flex-1 flex flex-col">
+    <div class="flex-1 min-w-0 flex flex-col">
       <template v-if="statesStore.selectedState">
         <!-- AppendLog Viewer for append_log states -->
         <template v-if="isAppendLog">
