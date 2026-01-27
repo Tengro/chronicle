@@ -503,66 +503,7 @@ impl Store {
     /// Returns None if the state didn't exist at that sequence.
     pub fn get_state_at(&self, state_id: &str, at_sequence: Sequence) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
-        let head = match self.state.get_head(branch_id, state_id) {
-            Some(h) => h,
-            None => return Ok(None),
-        };
-
-        // Walk chain backwards, collecting operations at or before target sequence
-        let mut operations = Vec::new();
-        let mut current_offset = Some(head.head_offset);
-        let mut hit_snapshot = false;
-        let mut found_any = false;
-
-        while let Some(offset) = current_offset {
-            let record = self.log.read_at(offset)?;
-
-            // Skip if this record is after the target sequence
-            if record.sequence > at_sequence {
-                // Parse just to get prev_update_offset
-                let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-                current_offset = update.prev_update_offset;
-                continue;
-            }
-
-            found_any = true;
-
-            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
-                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
-
-            match &update.operation {
-                StateOperation::Snapshot(_) => {
-                    operations.push(update.operation.clone());
-                    break;
-                }
-                StateOperation::DeltaSnapshot(_) => {
-                    operations.push(update.operation.clone());
-                    hit_snapshot = true;
-                }
-                _ => {
-                    if !hit_snapshot {
-                        operations.push(update.operation.clone());
-                    }
-                }
-            }
-
-            current_offset = update.prev_update_offset;
-        }
-
-        if !found_any {
-            // State didn't exist at that sequence
-            return Ok(None);
-        }
-
-        // Apply operations in forward order
-        operations.reverse();
-        let mut state = Vec::new();
-        for op in operations {
-            state = crate::state::apply_operation(state, op)?;
-        }
-
-        Ok(Some(state))
+        self.get_state_at_for_branch(branch_id, state_id, at_sequence)
     }
 
     /// Get the value of a state at a specific sequence on a specific branch.
@@ -1116,7 +1057,27 @@ impl Store {
         Ok(new_branch)
     }
 
-    /// Create a branch at a specific sequence.
+    /// Create a branch at a specific sequence (time-travel branching).
+    ///
+    /// This creates a new branch that starts with the state as it existed at the
+    /// given sequence on the parent branch. The state is materialized by writing
+    /// snapshot records to the new branch.
+    ///
+    /// # Branch Head vs Branch Point
+    ///
+    /// The returned branch's `head` may be greater than `at` because state
+    /// materialization writes snapshot records:
+    /// - `branch_point`: The sequence this branch diverged from (always equals `at`)
+    /// - `head`: The current head sequence (equals `at` + number of states materialized)
+    ///
+    /// For example, if branching at sequence 5 with 3 registered states, the branch
+    /// will have `branch_point = 5` and `head = 8` (5 + 3 snapshots).
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - Name for the new branch
+    /// * `from` - Parent branch name to branch from
+    /// * `at` - Sequence number on parent to branch at (must be <= parent's head)
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
         let parent = self
             .branches
