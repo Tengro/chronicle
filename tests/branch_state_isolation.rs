@@ -598,6 +598,354 @@ fn test_state_modifications_after_reopen() {
 }
 
 // =============================================================================
+// CREATE_BRANCH_AT STATE INHERITANCE TESTS
+// =============================================================================
+
+#[test]
+fn test_create_branch_at_inherits_state_at_branch_point() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    // Register state
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Add some state on main
+    store
+        .update_state("messages", StateOperation::Append(b"\"msg1\"".to_vec()))
+        .unwrap(); // seq 1
+    store
+        .update_state("messages", StateOperation::Append(b"\"msg2\"".to_vec()))
+        .unwrap(); // seq 2
+    store
+        .update_state("messages", StateOperation::Append(b"\"msg3\"".to_vec()))
+        .unwrap(); // seq 3
+    store
+        .update_state("messages", StateOperation::Append(b"\"msg4\"".to_vec()))
+        .unwrap(); // seq 4
+
+    // Verify state at different points on main
+    let state_at_2 = store
+        .get_state_at("messages", chronicle::Sequence(2))
+        .unwrap()
+        .unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state_at_2).unwrap();
+    assert_eq!(data, vec!["msg1", "msg2"]);
+
+    // Create branch at sequence 2
+    store
+        .create_branch_at("branch-at-2", "main", chronicle::Sequence(2))
+        .unwrap();
+    store.switch_branch("branch-at-2").unwrap();
+
+    // Branch should have the state that existed at sequence 2
+    let branch_state = store.get_state("messages").unwrap().unwrap();
+    let branch_data: Vec<String> = serde_json::from_slice(&branch_state).unwrap();
+    assert_eq!(branch_data, vec!["msg1", "msg2"]);
+
+    // Add more state on the branch
+    store
+        .update_state(
+            "messages",
+            StateOperation::Append(b"\"branch-msg\"".to_vec()),
+        )
+        .unwrap();
+
+    let branch_state_after = store.get_state("messages").unwrap().unwrap();
+    let branch_data_after: Vec<String> = serde_json::from_slice(&branch_state_after).unwrap();
+    assert_eq!(branch_data_after, vec!["msg1", "msg2", "branch-msg"]);
+
+    // Main branch should still have all 4 messages
+    store.switch_branch("main").unwrap();
+    let main_state = store.get_state("messages").unwrap().unwrap();
+    let main_data: Vec<String> = serde_json::from_slice(&main_state).unwrap();
+    assert_eq!(main_data, vec!["msg1", "msg2", "msg3", "msg4"]);
+}
+
+#[test]
+fn test_create_branch_at_with_multiple_states() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    // Register multiple states
+    store
+        .register_state(StateRegistration {
+            id: "messages".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    store
+        .register_state(StateRegistration {
+            id: "conversations".to_string(),
+            strategy: StateStrategy::Snapshot,
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Build up state
+    store
+        .update_state("messages", StateOperation::Append(b"\"m1\"".to_vec()))
+        .unwrap();
+    store
+        .update_state(
+            "conversations",
+            StateOperation::Set(b"{\"conv1\": true}".to_vec()),
+        )
+        .unwrap();
+    store
+        .update_state("messages", StateOperation::Append(b"\"m2\"".to_vec()))
+        .unwrap();
+    // seq 3
+
+    store
+        .update_state(
+            "conversations",
+            StateOperation::Set(b"{\"conv1\": true, \"conv2\": true}".to_vec()),
+        )
+        .unwrap();
+    store
+        .update_state("messages", StateOperation::Append(b"\"m3\"".to_vec()))
+        .unwrap();
+    // seq 5
+
+    // Branch at sequence 3 (before conv2 and m3)
+    store
+        .create_branch_at("historical", "main", chronicle::Sequence(3))
+        .unwrap();
+    store.switch_branch("historical").unwrap();
+
+    // Check messages - should have m1, m2
+    let msgs = store.get_state("messages").unwrap().unwrap();
+    let msgs_data: Vec<String> = serde_json::from_slice(&msgs).unwrap();
+    assert_eq!(msgs_data, vec!["m1", "m2"]);
+
+    // Check conversations - should have only conv1
+    let convs = store.get_state("conversations").unwrap().unwrap();
+    let convs_data: serde_json::Value = serde_json::from_slice(&convs).unwrap();
+    assert_eq!(convs_data, serde_json::json!({"conv1": true}));
+}
+
+#[test]
+fn test_create_branch_at_sequence_zero() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "data".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Add state
+    store
+        .update_state("data", StateOperation::Append(b"\"v1\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("data", StateOperation::Append(b"\"v2\"".to_vec()))
+        .unwrap();
+
+    // Branch at sequence 0 (before any writes)
+    store
+        .create_branch_at("genesis", "main", chronicle::Sequence(0))
+        .unwrap();
+    store.switch_branch("genesis").unwrap();
+
+    // Should have empty state (no state existed at seq 0)
+    let state = store.get_state("data").unwrap();
+    assert!(state.is_none());
+
+    // Can add state to this branch
+    store
+        .update_state("data", StateOperation::Append(b"\"genesis-v1\"".to_vec()))
+        .unwrap();
+    let state = store.get_state("data").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["genesis-v1"]);
+}
+
+#[test]
+fn test_create_branch_at_persists_across_reopen() {
+    let dir = TempDir::new().unwrap();
+
+    // First session - create branch at historical point
+    {
+        let store = test_store(&dir);
+
+        store
+            .register_state(StateRegistration {
+                id: "log".to_string(),
+                strategy: StateStrategy::AppendLog {
+                    delta_snapshot_every: 10,
+                    full_snapshot_every: 50,
+                },
+                initial_value: None,
+            })
+            .unwrap();
+
+        store
+            .update_state("log", StateOperation::Append(b"\"a\"".to_vec()))
+            .unwrap();
+        store
+            .update_state("log", StateOperation::Append(b"\"b\"".to_vec()))
+            .unwrap();
+        store
+            .update_state("log", StateOperation::Append(b"\"c\"".to_vec()))
+            .unwrap();
+
+        // Branch at seq 2 (should have a, b)
+        store
+            .create_branch_at("time-travel", "main", chronicle::Sequence(2))
+            .unwrap();
+
+        store.sync().unwrap();
+    }
+
+    // Second session - verify branch state persisted
+    {
+        let store = open_store(&dir);
+
+        store.switch_branch("time-travel").unwrap();
+        let state = store.get_state("log").unwrap().unwrap();
+        let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+        assert_eq!(data, vec!["a", "b"]);
+
+        store.switch_branch("main").unwrap();
+        let state = store.get_state("log").unwrap().unwrap();
+        let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+        assert_eq!(data, vec!["a", "b", "c"]);
+    }
+}
+
+#[test]
+fn test_create_branch_at_from_non_main_branch() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "log".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    // Build state on main
+    store
+        .update_state("log", StateOperation::Append(b"\"main1\"".to_vec()))
+        .unwrap();
+
+    // Create feature branch and add more state
+    store.create_branch("feature", None).unwrap();
+    store.switch_branch("feature").unwrap();
+    store
+        .update_state("log", StateOperation::Append(b"\"feature1\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("log", StateOperation::Append(b"\"feature2\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("log", StateOperation::Append(b"\"feature3\"".to_vec()))
+        .unwrap();
+
+    // Now branch from feature at seq 3 (should have main1, feature1, feature2)
+    store
+        .create_branch_at("feature-fork", "feature", chronicle::Sequence(3))
+        .unwrap();
+    store.switch_branch("feature-fork").unwrap();
+
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["main1", "feature1", "feature2"]);
+
+    // Add to the fork
+    store
+        .update_state("log", StateOperation::Append(b"\"fork1\"".to_vec()))
+        .unwrap();
+
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["main1", "feature1", "feature2", "fork1"]);
+
+    // Verify feature branch still has all 4 items
+    store.switch_branch("feature").unwrap();
+    let state = store.get_state("log").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["main1", "feature1", "feature2", "feature3"]);
+}
+
+#[test]
+fn test_create_branch_at_head_sequence() {
+    let dir = TempDir::new().unwrap();
+    let store = test_store(&dir);
+
+    store
+        .register_state(StateRegistration {
+            id: "data".to_string(),
+            strategy: StateStrategy::AppendLog {
+                delta_snapshot_every: 10,
+                full_snapshot_every: 50,
+            },
+            initial_value: None,
+        })
+        .unwrap();
+
+    store
+        .update_state("data", StateOperation::Append(b"\"a\"".to_vec()))
+        .unwrap();
+    store
+        .update_state("data", StateOperation::Append(b"\"b\"".to_vec()))
+        .unwrap();
+
+    // Get current head
+    let main_branch = store.current_branch();
+    let head_seq = main_branch.head;
+
+    // Branch at HEAD (equivalent to create_branch in terms of state)
+    store
+        .create_branch_at("at-head", "main", head_seq)
+        .unwrap();
+    store.switch_branch("at-head").unwrap();
+
+    // Should have same state as main at that moment
+    let state = store.get_state("data").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["a", "b"]);
+
+    // Now add to main after branching
+    store.switch_branch("main").unwrap();
+    store
+        .update_state("data", StateOperation::Append(b"\"c\"".to_vec()))
+        .unwrap();
+
+    // at-head branch should NOT see the new item
+    store.switch_branch("at-head").unwrap();
+    let state = store.get_state("data").unwrap().unwrap();
+    let data: Vec<String> = serde_json::from_slice(&state).unwrap();
+    assert_eq!(data, vec!["a", "b"]);
+}
+
+// =============================================================================
 // BRANCH DELETION TESTS
 // =============================================================================
 
