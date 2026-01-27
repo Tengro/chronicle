@@ -420,6 +420,72 @@ impl Store {
         Ok(record)
     }
 
+    /// Write a snapshot to a specific branch (used for branch state materialization).
+    ///
+    /// This is similar to update_state but:
+    /// - Writes to a specific branch rather than the current branch
+    /// - Only writes Snapshot operations
+    /// - Does not trigger auto-snapshot logic
+    fn write_snapshot_for_branch(
+        &self,
+        branch_id: crate::types::BranchId,
+        state_id: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let _lock = self.write_lock.lock();
+
+        let branch = self
+            .branches
+            .get_branch_by_id(branch_id)
+            .ok_or_else(|| StoreError::BranchNotFound(format!("{:?}", branch_id)))?;
+
+        let operation = StateOperation::Snapshot(data);
+
+        // Get current head offset for this state (for chaining) - will be None for new branch
+        let prev_update_offset = self
+            .state
+            .get_head(branch_id, state_id)
+            .map(|h| h.head_offset);
+
+        let next_seq = branch.head.next();
+
+        // Create the state update record payload
+        let update = StateUpdateRecord {
+            record_id: RecordId(0), // Will be assigned
+            global_sequence: next_seq,
+            state_id: state_id.to_string(),
+            prev_update_offset,
+            operation: operation.clone(),
+            timestamp: Timestamp::now(),
+        };
+
+        // Serialize and append
+        let payload = serde_json::to_vec(&update)?;
+        let input = RecordInput::raw("state_update", payload);
+
+        let (record, offset) = self.log.append(input, branch_id, next_seq)?;
+
+        // Update the state manager with the offset
+        self.state
+            .record_update(branch_id, state_id, offset, &operation)?;
+
+        // Update indices
+        self.index.add(
+            record.id,
+            branch_id,
+            next_seq,
+            offset,
+            &record.record_type,
+            &record.caused_by,
+            &record.linked_to,
+        );
+
+        // Update branch head
+        self.branches.update_head(branch_id, next_seq)?;
+
+        Ok(())
+    }
+
     /// Get the current value of a state.
     pub fn get_state(&self, state_id: &str) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
@@ -437,6 +503,78 @@ impl Store {
     /// Returns None if the state didn't exist at that sequence.
     pub fn get_state_at(&self, state_id: &str, at_sequence: Sequence) -> Result<Option<Vec<u8>>> {
         let branch_id = self.branches.current_branch().id;
+        let head = match self.state.get_head(branch_id, state_id) {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        // Walk chain backwards, collecting operations at or before target sequence
+        let mut operations = Vec::new();
+        let mut current_offset = Some(head.head_offset);
+        let mut hit_snapshot = false;
+        let mut found_any = false;
+
+        while let Some(offset) = current_offset {
+            let record = self.log.read_at(offset)?;
+
+            // Skip if this record is after the target sequence
+            if record.sequence > at_sequence {
+                // Parse just to get prev_update_offset
+                let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
+                    .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+                current_offset = update.prev_update_offset;
+                continue;
+            }
+
+            found_any = true;
+
+            let update: StateUpdateRecord = serde_json::from_slice(&record.payload)
+                .map_err(|e| StoreError::Deserialization(e.to_string()))?;
+
+            match &update.operation {
+                StateOperation::Snapshot(_) => {
+                    operations.push(update.operation.clone());
+                    break;
+                }
+                StateOperation::DeltaSnapshot(_) => {
+                    operations.push(update.operation.clone());
+                    hit_snapshot = true;
+                }
+                _ => {
+                    if !hit_snapshot {
+                        operations.push(update.operation.clone());
+                    }
+                }
+            }
+
+            current_offset = update.prev_update_offset;
+        }
+
+        if !found_any {
+            // State didn't exist at that sequence
+            return Ok(None);
+        }
+
+        // Apply operations in forward order
+        operations.reverse();
+        let mut state = Vec::new();
+        for op in operations {
+            state = crate::state::apply_operation(state, op)?;
+        }
+
+        Ok(Some(state))
+    }
+
+    /// Get the value of a state at a specific sequence on a specific branch.
+    ///
+    /// This is like `get_state_at` but allows querying a branch other than the current one.
+    /// Used internally for branch state materialization.
+    fn get_state_at_for_branch(
+        &self,
+        branch_id: crate::types::BranchId,
+        state_id: &str,
+        at_sequence: Sequence,
+    ) -> Result<Option<Vec<u8>>> {
         let head = match self.state.get_head(branch_id, state_id) {
             Some(h) => h,
             None => return Ok(None),
@@ -980,12 +1118,32 @@ impl Store {
 
     /// Create a branch at a specific sequence.
     pub fn create_branch_at(&self, name: &str, from: &str, at: Sequence) -> Result<Branch> {
+        let parent = self
+            .branches
+            .get_branch(from)
+            .ok_or_else(|| StoreError::BranchNotFound(from.to_string()))?;
+
         let new_branch = self.branches.create_branch_at(name, from, at)?;
 
-        // Broadcast branch created
-        self.subscriptions.broadcast_branch_created(&new_branch, Some(from.to_string()));
+        // Materialize parent state at branch point into new branch.
+        // This gives the new branch its own independent state chain starting
+        // with snapshots of the parent's state at the branch point.
+        for state_id in self.state.state_ids() {
+            if let Some(bytes) = self.get_state_at_for_branch(parent.id, &state_id, at)? {
+                self.write_snapshot_for_branch(new_branch.id, &state_id, bytes)?;
+            }
+        }
 
-        Ok(new_branch)
+        // Broadcast branch created (get updated branch with potentially new head)
+        let final_branch = self
+            .branches
+            .get_branch(name)
+            .ok_or_else(|| StoreError::BranchNotFound(name.to_string()))?;
+
+        self.subscriptions
+            .broadcast_branch_created(&final_branch, Some(from.to_string()));
+
+        Ok(final_branch)
     }
 
     /// Switch to a different branch.
